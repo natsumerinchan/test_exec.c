@@ -1016,15 +1016,25 @@ ssize_t read_code(struct file *file, unsigned long addr, loff_t pos, size_t len)
 }
 EXPORT_SYMBOL(read_code);
 
+/*
+ * Maps the mm_struct mm into the current task struct.
+ * On success, this function returns with exec_update_lock
+ * held for writing.
+ */
 static int exec_mmap(struct mm_struct *mm)
 {
 	struct task_struct *tsk;
 	struct mm_struct *old_mm, *active_mm;
+	int ret;
 
 	/* Notify parent that we're no longer interested in the old VM */
 	tsk = current;
 	old_mm = current->mm;
 	exec_mm_release(tsk, old_mm);
+
+	ret = down_write_killable(&tsk->signal->exec_update_lock);
+	if (ret)
+		return ret;
 
 	if (old_mm) {
 		sync_mm_rss(old_mm);
@@ -1037,9 +1047,11 @@ static int exec_mmap(struct mm_struct *mm)
 		down_read(&old_mm->mmap_sem);
 		if (unlikely(old_mm->core_state)) {
 			up_read(&old_mm->mmap_sem);
+			up_write(&tsk->signal->exec_update_lock);
 			return -EINTR;
 		}
 	}
+
 	task_lock(tsk);
 	membarrier_exec_mmap(mm);
 
@@ -1061,9 +1073,7 @@ static int exec_mmap(struct mm_struct *mm)
 		local_irq_enable();
 	tsk->mm->vmacache_seqnum = 0;
 	vmacache_flush(tsk);
-	lru_gen_add_mm(mm);
 	task_unlock(tsk);
-	lru_gen_use_mm(mm);
 	if (old_mm) {
 		up_read(&old_mm->mmap_sem);
 		BUG_ON(active_mm != old_mm);
@@ -1210,6 +1220,10 @@ no_thread_group:
 	/* we have changed execution domain */
 	tsk->exit_signal = SIGCHLD;
 
+#ifdef CONFIG_POSIX_TIMERS
+	exit_itimers(sig);
+	flush_itimer_signals();
+#endif
 
 	if (refcount_read(&oldsighand->count) != 1) {
 		struct sighand_struct *newsighand;
@@ -1277,21 +1291,15 @@ void __set_task_comm(struct task_struct *tsk, const char *buf, bool exec)
  */
 int flush_old_exec(struct linux_binprm * bprm)
 {
-	struct task_struct *me = current;
 	int retval;
 
 	/*
 	 * Make sure we have a private signal table and that
 	 * we are unassociated from the previous thread group.
 	 */
-	retval = de_thread(me);
+	retval = de_thread(current);
 	if (retval)
 		goto out;
-
-#ifdef CONFIG_POSIX_TIMERS
-	exit_itimers(me);
-	flush_itimer_signals();
-#endif
 
 	/*
 	 * Must be called _before_ exec_mmap() as bprm->mm is
@@ -1311,18 +1319,19 @@ int flush_old_exec(struct linux_binprm * bprm)
 		goto out;
 
 	/*
-	 * After clearing bprm->mm (to mark that current is using the
-	 * prepared mm now), we have nothing left of the original
+	 * After setting bprm->called_exec_mmap (to mark that current is
+	 * using the prepared mm now), we have nothing left of the original
 	 * process. If anything from here on returns an error, the check
 	 * in search_binary_handler() will SEGV current.
 	 */
+	bprm->called_exec_mmap = 1;
 	bprm->mm = NULL;
 
 	set_fs(USER_DS);
-	me->flags &= ~(PF_RANDOMIZE | PF_FORKNOEXEC | PF_KTHREAD |
+	current->flags &= ~(PF_RANDOMIZE | PF_FORKNOEXEC | PF_KTHREAD |
 					PF_NOFREEZE | PF_NO_SETAFFINITY);
 	flush_thread();
-	me->personality &= ~bprm->per_clear;
+	current->personality &= ~bprm->per_clear;
 
 	/*
 	 * We have to apply CLOEXEC before we change whether the process is
@@ -1330,7 +1339,7 @@ int flush_old_exec(struct linux_binprm * bprm)
 	 * trying to access the should-be-closed file descriptors of a process
 	 * undergoing exec(2).
 	 */
-	do_close_on_exec(me->files);
+	do_close_on_exec(current->files);
 	return 0;
 
 out:
@@ -1449,6 +1458,8 @@ static void free_bprm(struct linux_binprm *bprm)
 {
 	free_arg_pages(bprm);
 	if (bprm->cred) {
+		if (bprm->called_exec_mmap)
+			up_write(&current->signal->exec_update_lock);
 		mutex_unlock(&current->signal->cred_guard_mutex);
 		abort_creds(bprm->cred);
 	}
@@ -1459,6 +1470,7 @@ static void free_bprm(struct linux_binprm *bprm)
 	/* If a binfmt changed the interp, free it. */
 	if (bprm->interp != bprm->filename)
 		kfree(bprm->interp);
+	kfree(bprm);
 }
 
 int bprm_change_interp(const char *interp, struct linux_binprm *bprm)
@@ -1497,6 +1509,7 @@ void install_exec_creds(struct linux_binprm *bprm)
 	 * credentials; any time after this it may be unlocked.
 	 */
 	security_bprm_committed_creds(bprm);
+	up_write(&current->signal->exec_update_lock);
 	mutex_unlock(&current->signal->cred_guard_mutex);
 }
 EXPORT_SYMBOL(install_exec_creds);
@@ -1688,7 +1701,7 @@ int search_binary_handler(struct linux_binprm *bprm)
 
 		read_lock(&binfmt_lock);
 		put_binfmt(fmt);
-		if (retval < 0 && !bprm->mm) {
+		if (retval < 0 && bprm->called_exec_mmap) {
 			/* we got to flush_old_exec() and failed after it */
 			read_unlock(&binfmt_lock);
 			force_sigsegv(SIGSEGV);
@@ -1746,7 +1759,7 @@ static int __do_execve_file(int fd, struct filename *filename,
 			    int flags, struct file *file)
 {
 	char *pathbuf = NULL;
-	struct linux_binprm bprm;
+	struct linux_binprm *bprm;
 	struct files_struct *displaced;
 	int retval;
 
@@ -1773,13 +1786,16 @@ static int __do_execve_file(int fd, struct filename *filename,
 	if (retval)
 		goto out_ret;
 
-	memset(&bprm, 0, sizeof(bprm));
+	retval = -ENOMEM;
+	bprm = kzalloc(sizeof(*bprm), GFP_KERNEL);
+	if (!bprm)
+		goto out_files;
 
-	retval = prepare_bprm_creds(&bprm);
+	retval = prepare_bprm_creds(bprm);
 	if (retval)
 		goto out_free;
 
-	check_unsafe_exec(&bprm);
+	check_unsafe_exec(bprm);
 	current->in_execve = 1;
 
 	if (!file)
@@ -1790,11 +1806,11 @@ static int __do_execve_file(int fd, struct filename *filename,
 
 	sched_exec();
 
-	bprm.file = file;
+	bprm->file = file;
 	if (!filename) {
-		bprm.filename = "none";
+		bprm->filename = "none";
 	} else if (fd == AT_FDCWD || filename->name[0] == '/') {
-		bprm.filename = filename->name;
+		bprm->filename = filename->name;
 	} else {
 		if (filename->name[0] == '\0')
 			pathbuf = kasprintf(GFP_KERNEL, "/dev/fd/%d", fd);
@@ -1811,33 +1827,33 @@ static int __do_execve_file(int fd, struct filename *filename,
 		 * current->files (due to unshare_files above).
 		 */
 		if (close_on_exec(fd, rcu_dereference_raw(current->files->fdt)))
-			bprm.interp_flags |= BINPRM_FLAGS_PATH_INACCESSIBLE;
-		bprm.filename = pathbuf;
+			bprm->interp_flags |= BINPRM_FLAGS_PATH_INACCESSIBLE;
+		bprm->filename = pathbuf;
 	}
-	bprm.interp = bprm.filename;
+	bprm->interp = bprm->filename;
 
-	retval = bprm_mm_init(&bprm);
+	retval = bprm_mm_init(bprm);
 	if (retval)
 		goto out_unmark;
 
-	retval = prepare_arg_pages(&bprm, argv, envp);
+	retval = prepare_arg_pages(bprm, argv, envp);
 	if (retval < 0)
 		goto out;
 
-	retval = prepare_binprm(&bprm);
+	retval = prepare_binprm(bprm);
 	if (retval < 0)
 		goto out;
 
-	retval = copy_strings_kernel(1, &bprm.filename, &bprm);
+	retval = copy_strings_kernel(1, &bprm->filename, bprm);
 	if (retval < 0)
 		goto out;
 
-	bprm.exec = bprm.p;
-	retval = copy_strings(bprm.envc, envp, &bprm);
+	bprm->exec = bprm->p;
+	retval = copy_strings(bprm->envc, envp, bprm);
 	if (retval < 0)
 		goto out;
 
-	retval = copy_strings(bprm.argc, argv, &bprm);
+	retval = copy_strings(bprm->argc, argv, bprm);
 	if (retval < 0)
 		goto out;
 
@@ -1847,15 +1863,15 @@ static int __do_execve_file(int fd, struct filename *filename,
 	 * from argv[1] won't end up walking envp. See also
 	 * bprm_stack_limits().
 	 */
-	if (bprm.argc == 0) {
+	if (bprm->argc == 0) {
 		const char *argv[] = { "", NULL };
-		retval = copy_strings_kernel(1, argv, &bprm);
+		retval = copy_strings_kernel(1, argv, bprm);
 		if (retval < 0)
 			goto out;
-		bprm.argc = 1;
+		bprm->argc = 1;
 	}
 
-	retval = exec_binprm(&bprm);
+	retval = exec_binprm(bprm);
 	if (retval < 0)
 		goto out;
 
@@ -1865,7 +1881,7 @@ static int __do_execve_file(int fd, struct filename *filename,
 	rseq_execve(current);
 	acct_update_integrals(current);
 	task_numa_free(current, false);
-	free_bprm(&bprm);
+	free_bprm(bprm);
 	kfree(pathbuf);
 	if (filename)
 		putname(filename);
@@ -1874,9 +1890,9 @@ static int __do_execve_file(int fd, struct filename *filename,
 	return retval;
 
 out:
-	if (bprm.mm) {
-		acct_arg_size(&bprm, 0);
-		mmput(bprm.mm);
+	if (bprm->mm) {
+		acct_arg_size(bprm, 0);
+		mmput(bprm->mm);
 	}
 
 out_unmark:
@@ -1884,9 +1900,10 @@ out_unmark:
 	current->in_execve = 0;
 
 out_free:
-	free_bprm(&bprm);
+	free_bprm(bprm);
 	kfree(pathbuf);
 
+out_files:
 	if (displaced)
 		reset_files_struct(displaced);
 out_ret:
